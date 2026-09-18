@@ -9,6 +9,8 @@
     uv run tg.py chats -n 30
     uv run tg.py search php
     uv run tg.py resolve @phpdigest @prophp7
+    uv run tg.py activity @chat1 @chat2
+    uv run tg.py find @chat Пенза
     uv run tg.py media <чат> -n 50
     uv run tg.py get <чат> <msg_id>
     uv run tg.py probe downloads/файл.ogg
@@ -19,7 +21,7 @@ import json
 import os
 import subprocess
 import sys
-import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from telethon import TelegramClient, functions, utils
@@ -109,7 +111,7 @@ async def cmd_resolve(args):
     async with client() as c:
         for i, name in enumerate(args.names):
             if i:
-                time.sleep(args.delay)
+                await asyncio.sleep(args.delay)
             uname = name.lstrip("@")
             try:
                 e = await c.get_entity(uname)
@@ -127,6 +129,70 @@ async def cmd_resolve(args):
             print(f"{utils.get_peer_id(e):>15}  {chat_kind(e):<6}  @{uname:<24}  "
                   f"{count if count is not None else '':>8}  {utils.get_display_name(e)}"
                   + (f"  | {about}" if about else ""))
+
+
+async def cmd_activity(args):
+    """Живой чат или накрученный: подписчики против реальной активности.
+
+    Крупные цифры подписчиков сами по себе ничего не значат - группу на 8000
+    человек, где за месяц ноль сообщений, накрутили. Смотреть надо на число
+    людей, которые реально пишут.
+    """
+    since = datetime.now(timezone.utc) - timedelta(days=args.days)
+    async with client() as c:
+        for i, name in enumerate(args.names):
+            if i:
+                await asyncio.sleep(args.delay)
+            uname = name.lstrip("@")
+            try:
+                e = await c.get_entity(peer(uname))
+            except Exception as err:
+                print(f"@{uname:<26} недоступен ({type(err).__name__})")
+                continue
+            count = None
+            if isinstance(e, Channel):
+                try:
+                    count = (await c(functions.channels.GetFullChannelRequest(e))).full_chat.participants_count
+                except Exception:
+                    pass
+            last, n, authors = None, 0, set()
+            try:
+                async for m in c.iter_messages(e, limit=args.scan):
+                    if last is None:
+                        last = m.date
+                    if m.date < since:
+                        break
+                    n += 1
+                    if m.sender_id:
+                        authors.add(m.sender_id)
+            except Exception as err:
+                print(f"@{uname:<26} {chat_kind(e):<6} {count or 0:>6} подп.  "
+                      f"история закрыта ({type(err).__name__})")
+                continue
+            age = f"{(datetime.now(timezone.utc) - last).days}" if last else "?"
+            # уперлись в лимит сканирования - значит сообщений больше
+            more = "+" if n == args.scan else ""
+            print(f"@{uname:<26} {chat_kind(e):<6} {count or 0:>6} подп.  "
+                  f"последнее: {age:>4} дн. назад  "
+                  f"за {args.days} дн: {str(n) + more:>5} сообщ. от {len(authors):>3} чел.")
+
+
+async def cmd_find(args):
+    """Поиск слова внутри чата: есть ли там нужный город/тема и насколько свежо."""
+    now = datetime.now(timezone.utc)
+    async with client() as c:
+        n, authors, recent = 0, set(), []
+        async for m in c.iter_messages(peer(args.chat), search=args.word, limit=args.limit):
+            n += 1
+            if m.sender_id:
+                authors.add(m.sender_id)
+            if len(recent) < args.show:
+                uname = str(args.chat).lstrip("@")
+                link = f"msg {m.id}" if uname.lstrip("-").isdigit() else f"https://t.me/{uname}/{m.id}"
+                recent.append(f"    {(now - m.date).days:>5} дн. назад   {link}")
+        more = "+" if n == args.limit else ""
+        print(f"«{args.word}» в {args.chat}: {n}{more} сообщений от {len(authors)} человек")
+        print("\n".join(recent))
 
 
 async def cmd_media(args):
@@ -219,6 +285,18 @@ def main():
     c = sub.add_parser("resolve", help="проверить @username через API: тип, подписчики, описание")
     c.add_argument("names", nargs="+")
     c.add_argument("--delay", type=float, default=0.5, help="пауза между запросами, сек")
+
+    c = sub.add_parser("activity", help="живой чат или накрученный: подписчики против активности")
+    c.add_argument("names", nargs="+")
+    c.add_argument("-d", "--days", type=int, default=30, help="окно активности, дней")
+    c.add_argument("--scan", type=int, default=200, help="сколько сообщений просмотреть")
+    c.add_argument("--delay", type=float, default=0.5, help="пауза между чатами, сек")
+
+    c = sub.add_parser("find", help="поиск слова внутри чата")
+    c.add_argument("chat")
+    c.add_argument("word")
+    c.add_argument("-n", "--limit", type=int, default=300)
+    c.add_argument("--show", type=int, default=8, help="сколько ссылок показать")
 
     c = sub.add_parser("media", help="аудио и голосовые в чате")
     c.add_argument("chat")
