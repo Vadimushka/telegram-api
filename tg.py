@@ -8,6 +8,7 @@
     uv run tg.py login
     uv run tg.py chats -n 30
     uv run tg.py search php
+    uv run tg.py resolve @phpdigest @prophp7
     uv run tg.py media <чат> -n 50
     uv run tg.py get <чат> <msg_id>
     uv run tg.py probe downloads/файл.ogg
@@ -18,6 +19,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from telethon import TelegramClient, functions, utils
@@ -96,6 +98,35 @@ async def cmd_search(args):
             uname = getattr(e, "username", None)
             print(f"{utils.get_peer_id(e):>15}  {chat_kind(e):<6}  "
                   f"{'@' + uname if uname else '':<24}  {utils.get_display_name(e)}")
+
+
+async def cmd_resolve(args):
+    """Проверить @username через API: жив ли, тип, подписчики, описание.
+
+    Дополняет search: список каналов можно набрать где угодно (веб-каталоги,
+    подборки), а реальные цифры отдаёт только сам Telegram.
+    """
+    async with client() as c:
+        for i, name in enumerate(args.names):
+            if i:
+                time.sleep(args.delay)
+            uname = name.lstrip("@")
+            try:
+                e = await c.get_entity(uname)
+            except Exception as err:
+                print(f"{'-':>15}  {'?':<6}  @{uname:<24}  НЕ НАЙДЕН ({type(err).__name__})")
+                continue
+            count, about = None, ""
+            if isinstance(e, Channel):
+                try:
+                    full = await c(functions.channels.GetFullChannelRequest(e))
+                    count = full.full_chat.participants_count
+                    about = (full.full_chat.about or "").replace("\n", " ")[:60]
+                except Exception:
+                    pass
+            print(f"{utils.get_peer_id(e):>15}  {chat_kind(e):<6}  @{uname:<24}  "
+                  f"{count if count is not None else '':>8}  {utils.get_display_name(e)}"
+                  + (f"  | {about}" if about else ""))
 
 
 async def cmd_media(args):
@@ -184,6 +215,10 @@ def main():
     c = sub.add_parser("search", help="поиск публичных каналов и групп")
     c.add_argument("query")
     c.add_argument("-n", "--limit", type=int, default=20)
+
+    c = sub.add_parser("resolve", help="проверить @username через API: тип, подписчики, описание")
+    c.add_argument("names", nargs="+")
+    c.add_argument("--delay", type=float, default=0.5, help="пауза между запросами, сек")
 
     c = sub.add_parser("media", help="аудио и голосовые в чате")
     c.add_argument("chat")
