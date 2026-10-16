@@ -306,10 +306,23 @@ async def cmd_find(args):
         print("\n".join(recent))
 
 
+class RecipientError(Exception):
+    """Получатель не найден или неоднозначен; candidates - подходящие диалоги."""
+
+    def __init__(self, msg, candidates=()):
+        super().__init__(msg)
+        self.candidates = list(candidates)
+
+
+def dialog_line(d):
+    uname = getattr(d.entity, "username", None)
+    return f"{d.id:>15}  {chat_kind(d.entity):<6}  {d.name}" + (f"  @{uname}" if uname else "")
+
+
 async def find_recipient(c, who):
     """@username / телефон / id -> напрямую, иначе ищем по имени среди диалогов.
 
-    Совпадений по имени несколько - не угадываем, печатаем список и выходим.
+    Совпадений по имени несколько - не угадываем, а отдаём список кандидатов.
     """
     if who.startswith("@") or who.startswith("+") or who.lstrip("-").isdigit():
         return await c.get_entity(peer(who) if not who.startswith("+") else who)
@@ -324,17 +337,19 @@ async def find_recipient(c, who):
     if len(found) == 1:
         return found[0].entity
     if not found:
-        sys.exit(f"Не нашёл «{who}» среди диалогов — укажи @username или id из `chats`")
-    print(f"«{who}» подходит под несколько диалогов, уточни:")
-    for d in found[:15]:
-        uname = getattr(d.entity, "username", None)
-        print(f"{d.id:>15}  {chat_kind(d.entity):<6}  {d.name}" + (f"  @{uname}" if uname else ""))
-    sys.exit(1)
+        raise RecipientError(f"Не нашёл «{who}» среди диалогов — укажи @username или id из `chats`")
+    raise RecipientError(f"«{who}» подходит под несколько диалогов, уточни:", found[:15])
 
 
 async def cmd_send(args):
     async with client() as c:
-        e = await find_recipient(c, args.to)
+        try:
+            e = await find_recipient(c, args.to)
+        except RecipientError as err:
+            print(err)
+            for d in err.candidates:
+                print(dialog_line(d))
+            sys.exit(1)
         name = utils.get_display_name(e)
         uname = getattr(e, "username", None)
         if args.dry_run:
