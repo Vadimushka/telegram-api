@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["telethon>=1.36"]
+# dependencies = ["telethon>=1.36", "python-socks[asyncio]", "qrcode"]
 # ///
 """Работа с Telegram через MTProto (свой аккаунт).
 
@@ -17,14 +17,19 @@
 """
 import argparse
 import asyncio
+import getpass
 import json
 import os
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlparse
 
-from telethon import TelegramClient, functions, utils
+import qrcode
+from telethon import TelegramClient, connection, functions, utils
+from telethon.errors import (PhoneCodeInvalidError, SendCodeUnavailableError,
+                             SessionPasswordNeededError)
 from telethon.tl.types import Channel, DocumentAttributeAudio, DocumentAttributeFilename
 
 ROOT = Path(__file__).parent
@@ -46,9 +51,39 @@ def load_env():
     return int(api_id), api_hash
 
 
+def proxy_kwargs(url):
+    """TG_PROXY -> аргументы TelegramClient.
+
+    socks5://user:pass@host:port, socks4://..., http://host:port
+    tg://proxy?server=host&port=443&secret=... (MTProxy, t.me/proxy?... тоже)
+    """
+    if not url:
+        return {}
+    u = urlparse(url)
+    if (u.scheme == "tg" and u.netloc == "proxy") or (u.scheme == "https" and u.path == "/proxy"):
+        q = parse_qs(u.query)
+        secret = q["secret"][0]
+        if secret.lower().startswith("ee"):
+            sys.exit("MTProxy с fake-TLS (secret на ee...) Telethon не поддерживает — нужен dd... или SOCKS5")
+        return {
+            "connection": connection.ConnectionTcpMTProxyRandomizedIntermediate,
+            "proxy": (q["server"][0], int(q["port"][0]), secret),
+        }
+    if u.scheme not in ("socks5", "socks4", "http"):
+        sys.exit(f"TG_PROXY: неизвестная схема {u.scheme!r}")
+    return {"proxy": {
+        "proxy_type": u.scheme, "addr": u.hostname, "port": u.port, "rdns": True,
+        "username": unquote(u.username) if u.username else None,
+        "password": unquote(u.password) if u.password else None,
+    }}
+
+
 def client():
     api_id, api_hash = load_env()
-    return TelegramClient(str(SESSION), api_id, api_hash)
+    # sessions/ в .gitignore, после клона её нет, а sqlite папку не создаёт
+    SESSION.parent.mkdir(exist_ok=True)
+    return TelegramClient(str(SESSION), api_id, api_hash,
+                          **proxy_kwargs(os.environ.get("TG_PROXY")))
 
 
 def peer(arg):
@@ -78,11 +113,87 @@ def file_name(doc):
     return None
 
 
+CODE_WHERE = {
+    "SentCodeTypeApp": "в приложение Telegram, служебный чат «Telegram» (777000)",
+    "SentCodeTypeSms": "по SMS",
+    "SentCodeTypeCall": "звонком",
+    "SentCodeTypeFlashCall": "сбросом звонка (код — последние цифры номера)",
+    "SentCodeTypeMissedCall": "пропущенным звонком (код — последние цифры номера)",
+    "SentCodeTypeEmailCode": "на email",
+    "SentCodeTypeFragmentSms": "через fragment.com",
+    "SentCodeTypeFirebaseSms": "Firebase SMS — только для официальных приложений",
+    "SentCodeTypeSmsWord": "по SMS (слово)",
+    "SentCodeTypeSmsPhrase": "по SMS (фраза)",
+}
+
+
+def describe_sent(sent):
+    kind = type(sent.type).__name__
+    print(f"Код отправлен: {CODE_WHERE.get(kind, kind)}  [{kind}]")
+    if sent.next_type:
+        nxt = type(sent.next_type).__name__.replace("CodeType", "SentCodeType")
+        print(f"Повторно можно: {CODE_WHERE.get(nxt, nxt)}"
+              + (f", не раньше чем через {sent.timeout} с" if sent.timeout else ""))
+
+
+async def qr_login(c):
+    """Вход по QR, как Telegram Desktop: код не нужен, подтверждает телефон.
+
+    Выручает, когда код в приложение не доходит - Telegram иногда молча
+    не доставляет его сторонним клиентам.
+    """
+    qr = await c.qr_login()
+    while True:
+        q = qrcode.QRCode(border=2)
+        q.add_data(qr.url)
+        q.print_ascii(invert=True)
+        print("Телефон: Настройки → Устройства → Подключить устройство → наведи на QR")
+        try:
+            await qr.wait()
+            return
+        except asyncio.TimeoutError:
+            print("QR истёк, новый:\n")
+            await qr.recreate()
+        except SessionPasswordNeededError:
+            await c.sign_in(password=getpass.getpass("Пароль 2FA: "))
+            return
+
+
 async def cmd_login(args):
-    async with client() as c:
+    """Вход вручную, а не через client.start(): видно, куда ушёл код, и можно переотправить."""
+    c = client()
+    await c.connect()
+    try:
+        if not await c.is_user_authorized() and args.qr:
+            await qr_login(c)
+        if not await c.is_user_authorized():
+            phone = os.environ.get("TG_PHONE") or input("Телефон (+7...): ").strip()
+            sent = await c.send_code_request(phone)
+            describe_sent(sent)
+            # каждый новый запуск login отменяет прошлый код - поэтому неверный
+            # код переспрашиваем здесь же, а не перезапуском
+            while True:
+                code = input("Код (пусто — переотправить другим способом): ").strip()
+                if not code:
+                    try:
+                        sent = await c(functions.auth.ResendCodeRequest(phone, sent.phone_code_hash))
+                        describe_sent(sent)
+                    except SendCodeUnavailableError:
+                        print("Других способов нет — код только в приложении, ищи самое свежее сообщение от «Telegram»")
+                    continue
+                try:
+                    await c.sign_in(phone, code, phone_code_hash=sent.phone_code_hash)
+                    break
+                except PhoneCodeInvalidError:
+                    print("Неверный код. Нужен код из самого последнего сообщения — старые уже не действуют.")
+                except SessionPasswordNeededError:
+                    await c.sign_in(password=getpass.getpass("Пароль 2FA: "))
+                    break
         me = await c.get_me()
         print(f"Авторизован: {me.first_name} @{me.username} (id {me.id})")
         print(f"Сессия: {SESSION}.session")
+    finally:
+        await c.disconnect()
 
 
 async def cmd_chats(args):
@@ -195,6 +306,50 @@ async def cmd_find(args):
         print("\n".join(recent))
 
 
+async def find_recipient(c, who):
+    """@username / телефон / id -> напрямую, иначе ищем по имени среди диалогов.
+
+    Совпадений по имени несколько - не угадываем, печатаем список и выходим.
+    """
+    if who.startswith("@") or who.startswith("+") or who.lstrip("-").isdigit():
+        return await c.get_entity(peer(who) if not who.startswith("+") else who)
+    q = who.casefold()
+    found = []
+    async for d in c.iter_dialogs():
+        name = d.name or ""
+        if name.casefold() == q:
+            return d.entity
+        if q in name.casefold():
+            found.append(d)
+    if len(found) == 1:
+        return found[0].entity
+    if not found:
+        sys.exit(f"Не нашёл «{who}» среди диалогов — укажи @username или id из `chats`")
+    print(f"«{who}» подходит под несколько диалогов, уточни:")
+    for d in found[:15]:
+        uname = getattr(d.entity, "username", None)
+        print(f"{d.id:>15}  {chat_kind(d.entity):<6}  {d.name}" + (f"  @{uname}" if uname else ""))
+    sys.exit(1)
+
+
+async def cmd_send(args):
+    async with client() as c:
+        e = await find_recipient(c, args.to)
+        name = utils.get_display_name(e)
+        uname = getattr(e, "username", None)
+        if args.dry_run:
+            print(f"Получатель: {name}" + (f" @{uname}" if uname else "") + f" (id {utils.get_peer_id(e)})")
+            return
+        text = " ".join(args.text)
+        if args.file:
+            m = await c.send_file(e, args.file, caption=text or None)
+        else:
+            if not text:
+                sys.exit("Пустое сообщение")
+            m = await c.send_message(e, text)
+        print(f"Отправлено → {name}" + (f" @{uname}" if uname else "") + f"  (msg {m.id})")
+
+
 async def cmd_media(args):
     async with client() as c:
         async for m in c.iter_messages(peer(args.chat), limit=args.limit):
@@ -273,7 +428,8 @@ def main():
     p = argparse.ArgumentParser(description="Telegram MTProto CLI")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("login", help="авторизация, создаёт файл сессии")
+    c = sub.add_parser("login", help="авторизация, создаёт файл сессии")
+    c.add_argument("--qr", action="store_true", help="вход по QR вместо кода")
 
     c = sub.add_parser("chats", help="список диалогов с id")
     c.add_argument("-n", "--limit", type=int, default=30)
@@ -297,6 +453,12 @@ def main():
     c.add_argument("word")
     c.add_argument("-n", "--limit", type=int, default=300)
     c.add_argument("--show", type=int, default=8, help="сколько ссылок показать")
+
+    c = sub.add_parser("send", help="отправить сообщение: @username, +телефон, id или имя из диалогов")
+    c.add_argument("to")
+    c.add_argument("text", nargs="*")
+    c.add_argument("-f", "--file", help="приложить файл (text станет подписью)")
+    c.add_argument("--dry-run", action="store_true", help="только найти получателя, не отправлять")
 
     c = sub.add_parser("media", help="аудио и голосовые в чате")
     c.add_argument("chat")
