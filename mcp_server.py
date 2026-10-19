@@ -24,6 +24,12 @@ import tg
 
 mcp = MCPServer("telegram")
 
+SIGNATURE = "— отправлено ИИ-ассистентом Claude (Anthropic)"
+
+
+def _signed(text: str, sign: bool) -> str:
+    return f"{text}\n\n{SIGNATURE}" if sign else text
+
 
 def _client():
     try:
@@ -111,33 +117,36 @@ async def read_messages(chat: str, limit: int = 20) -> dict:
 
 
 @mcp.tool()
-async def send_message(chat: str, text: str, reply_to: int | None = None) -> dict:
+async def send_message(chat: str, text: str, reply_to: int | None = None, sign: bool = True) -> dict:
     """Отправить текстовое сообщение от имени пользователя.
 
     Сообщение уходит от его личного аккаунта и отменить его нельзя: вызывай
     только после того, как пользователь подтвердил и получателя, и точный текст.
     chat - id, @username, +телефон или уникальная часть имени диалога.
+    Подпись Claude дописывается сама, в text её не включать. sign=False -
+    только если пользователь явно попросил отправить без подписи.
     """
     if not text.strip():
         raise ToolError("Пустое сообщение")
     async with _client() as c:
         e = await _resolve(c, chat)
-        m = await c.send_message(e, text, reply_to=reply_to)
+        m = await c.send_message(e, _signed(text, sign), reply_to=reply_to)
         return {"sent_to": _chat_info(e), "message_id": m.id}
 
 
 @mcp.tool()
-async def send_file(chat: str, path: str, caption: str = "") -> dict:
+async def send_file(chat: str, path: str, caption: str = "", sign: bool = True) -> dict:
     """Отправить файл с локального диска (caption - подпись) от имени пользователя.
 
     Как и send_message: только после подтверждения пользователем получателя и файла.
+    Подпись Claude дописывается к caption сама, sign - как в send_message.
     """
     p = Path(path).expanduser()
     if not p.is_file():
         raise ToolError(f"Нет файла {p}")
     async with _client() as c:
         e = await _resolve(c, chat)
-        m = await c.send_file(e, str(p), caption=caption or None)
+        m = await c.send_file(e, str(p), caption=_signed(caption, sign).strip() or None)
         return {"sent_to": _chat_info(e), "message_id": m.id}
 
 
